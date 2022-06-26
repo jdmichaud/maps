@@ -1,0 +1,232 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset=UTF-8>
+  <link rel="icon" href="data:;base64,iVBORw0KGgo=">
+  <title>Map</title>
+  <script type="text/javascript" src="https://unpkg.com/@jdmichaud/observable@0.5.2/dist/index.umd.js"></script>
+  <script>
+    const MAX_OSM_ZOOM = 19;
+    const OSM_TILE_RESX = 256;
+    const OSM_TILE_RESY = 256;
+
+    // https://wiki.openstreetmap.org/wiki/Slippy_map_tilenames#ECMAScript_.28JavaScript.2FActionScript.2C_etc..29
+    const mercatorProjectionCs = {
+      maxLatitude: Math.atan(Math.sinh(Math.PI)) * 360 / (2 * Math.PI),
+      // From mercator ([85, -85], [-180, 180]) to mercator projection ([0, 1], [0, 1])
+      from: ([lat, lon]) => {
+        const x = (lon + 180) / 360;
+        const y = (
+          1 - Math.log(
+            Math.tan(lat * Math.PI / 180) +
+            1 / Math.cos(lat * Math.PI / 180)
+          ) / Math.PI
+        ) / 2;
+
+        return [x, y];
+      },
+      // From mercator projection ([0, 1], [0, 1]) to mercator ([85, -85], [-180, 180])
+      to: ([x, y]) => {
+        const lon = x * 360 - 180;
+        const n = Math.PI - 2 * Math.PI * y;
+        const lat = 180 / Math.PI * Math.atan(0.5 * (Math.exp(n) - Math.exp(-n)));
+
+        return [lat, lon];
+      },
+    };
+    window.mercatorProjectionCs = mercatorProjectionCs;
+
+    const tileCS = {
+      // From tile to mercator projection (depends on the zoom).
+      from: ([tilex, tiley, zoom]) => {
+        const div = 1 / 2**zoom;
+        // Returns the coordinates of the top left of the tile.
+        return [div * tilex, div * tiley];
+      },
+      // From mercator projection to tile
+      to: ([x, y, zoom]) => [x * 2**zoom | 0, y * 2**zoom | 0],
+    }
+    window.tileCS = tileCS;
+
+    function CanvasCS({ width, height }) {
+      const canvasRatio = width / height;
+      return {
+        // From canvas to mercator projection
+        from: ([cx, cy, cz = 1], lookPoint, fov) => {
+          // cz is the homogeneous coordinate. Set to 0 for vectors.
+          const heightProjection = fov;
+          // The only ratio used here is the canvas because web mercator is a square.
+          const widthProjection = fov * canvasRatio;
+          const origin = [lookPoint[0] - widthProjection / 2, lookPoint[1] - heightProjection / 2];
+          const x = cx / width * widthProjection + (origin[0] * cz);
+          const y = cy / height * heightProjection + (origin[1] * cz);
+          return [x, y];
+        },
+        // From mercator projection to canvas
+        to: ([x, y, z = 1], lookPoint, fov) => {
+          // z is the homogeneous coordinate. Set to 0 for vectors.
+          const heightProjection = fov;
+          // The only ratio used here is the canvas because web mercator is a square.
+          const widthProjection = fov * canvasRatio;
+          const origin = [lookPoint[0] - widthProjection / 2, lookPoint[1] - heightProjection / 2];
+          const cx = (x - (origin[0] * z)) / widthProjection * width;
+          const cy = (y - (origin[1] * z)) / heightProjection * height;
+          return [cx, cy];
+        },
+      };
+    }
+
+    async function geocode(address) {
+      const response = await fetch(`https://nominatim.openstreetmap.org/search?q=${address}&format=json`);
+      return response.json();
+    }
+
+    // Generates the tiles coordinate to retrieve depending on the lookPoint and the zoom.
+    function getTilesCoordinates(lookPoint, fov, { width, height }) {
+      const tileWidth = OSM_TILE_RESX;
+      const tileHeight = OSM_TILE_RESY;
+      // Compute the zoom based on the resolution of the canvas and of the tile. Both should match
+      // so image quality is best while requesting as little tiles as possible.
+      const zoomHeight = Math.ceil(Math.log2(height / (fov * tileHeight) - 1));
+      const zoomWidth = Math.ceil(Math.log2(width / ((fov * (width / height)) * tileHeight) - 1));
+      const zoom = Math.min(MAX_OSM_ZOOM, Math.max(zoomWidth, zoomHeight));
+      // Compute canvas size in mercator CS
+      const hfov = fov * width / height;
+      const topLeftTile = tileCS.to([lookPoint[0] - hfov / 2, lookPoint[1] - fov / 2, zoom]);
+      const bottomRightTile = tileCS.to([lookPoint[0] + hfov / 2, lookPoint[1] + fov / 2, zoom]);
+      const tiles = [];
+      for (let i = Math.max(0, topLeftTile[0]); i <= Math.min(2**zoom - 1, bottomRightTile[0]); ++i) {
+        for (let j = Math.max(0, topLeftTile[1]); j <= Math.min(2**zoom - 1, bottomRightTile[1]); ++j) {
+          tiles.push({ tilex: i, tiley: j, zoom });
+        }
+      }
+      return tiles;
+    }
+
+
+    // Base on a tile coordinate and zoom fetch the tiles from OSM.
+    // The returned tile also contains metadata.
+    // TODO: Manage the tile resolution.
+    let tileCache = {};
+    async function fetchTiles({ tilex, tiley }, zoom) {
+      const key = `${zoom}-${tilex}-${tiley}`;
+      if (tileCache[key] === undefined) {
+        const response = await fetch(`http://tile.openstreetmap.org/${zoom}/${tilex}/${tiley}.png`);
+        const blob = await response.blob();
+        const image = await createImageBitmap(blob);
+        tileCache[key] = {
+          origin: tileCS.from([tilex, tiley, zoom]),
+          width: 1/2**zoom, // width in mercator projection
+          height: 1/2**zoom, // height in mercator projection
+          tilex,
+          tiley,
+          zoom,
+          image,
+        };
+      }
+      return tileCache[key];
+    }
+
+    function main() {
+      const input = document.getElementById('address');
+      const button = document.getElementById('go-btn');
+      const canvas = document.getElementById('map');
+      const canvasCS = new CanvasCS(canvas);
+      window.canvasCS = canvasCS; // Debug purposes
+      const ctx = canvas.getContext('2d');
+      const lookPointModel = { value: undefined, subject: new Observable.Subject() };
+      lookPointModel.subject.subscribe(v => lookPointModel.value = v);
+      const fovModel = { value: undefined, subject: new Observable.Subject() }
+      fovModel.subject.subscribe(v => fovModel.value = v);
+
+      // Execute a function when the user releases a key on the keyboard
+      input.addEventListener("keyup", function(event) {
+        // Number 13 is the "Enter" key on the keyboard
+        if (event.keyCode === 13) {
+          // Cancel the default action, if needed
+          event.preventDefault();
+          // Trigger the button element with a click
+          document.getElementById('go-btn').click();
+        }
+      });
+
+      // Convert the address in the input text to a geocoding.
+      // Basic for now as it only takes the first result.
+      button.addEventListener('click', async () => {
+        input.disabled = button.disabled = true;
+        const geocodings = await geocode(address.value);
+        // const geocodings = [{ lat: 0, lon: 0 }];
+        if (geocodings.length > 0) {
+          const { lat, lon } = geocodings[0];
+          const lookPoint = mercatorProjectionCs.from([parseFloat(lat), parseFloat(lon)]);
+          lookPointModel.subject.next(lookPoint);
+        }
+        input.disabled = button.disabled = false;
+      });
+
+      // Change the fov with the wheel.
+      // Divide or multiply it by two as the zoom parameters to OSM is an integer.
+      let wheelDebounce;
+      canvas.addEventListener('wheel', event => {
+        function updateFov() {
+          wheelDebounce = undefined;
+          let fov = Math.sign(event.deltaY) < 0 ? fovModel.value / 2 : fovModel.value * 2;
+          // The fov is supposed to always be under the form 1 / 2**n with n ∈ [0, 18] which are
+          // the accepted zoom value by OSM.
+          fov = Math.max(1 / 2**19, Math.min(1, fov));
+          if (fov !== fovModel.value) {
+            fovModel.subject.next(fov);
+          }
+        }
+        if (wheelDebounce !== undefined) {
+          clearTimeout(wheelDebounce);
+        }
+        wheelDebounce = setTimeout(updateFov, 20);
+      });
+
+      Observable.Observable.all([lookPointModel.subject, fovModel.subject]).subscribe(async ([lookPoint, fov]) => {
+        // Instead of clearing the canvas, and redrawing on potentially background pixels
+        // we zoom the previous canvas content so we 
+        // Retrieve OSM zoom factor based on fov.
+        const zoom = Math.log2(1 / fov) / Math.log2(2);
+        const tilePromises = getTilesCoordinates(lookPoint, fov, canvas)
+        .sort((tc1, tc2) => {
+          const [t1x, t1y] = tileCS.from([tc1.tilex, tc1.tiley, tc1.zoom]);
+          const [t2x, t2y] = tileCS.from([tc2.tilex, tc2.tiley, tc2.zoom]);
+          return (lookPoint[0] - t1x)**2 + (lookPoint[1] - t1y)**2 > (lookPoint[0] - t2x)**2 + (lookPoint[1] - t2y)**2;
+        })
+        .map(tc => fetchTiles(tc, tc.zoom));
+        for (tilePromise of tilePromises) {
+          const tile = await tilePromise;
+          // If the fovModel has changed since requesting current tiles, stop the loop.
+          if (fov !== fovModel.value) break;
+          // image posx and posy in the canvas
+          const [ix, iy] = canvasCS.to(tile.origin, lookPoint, fov);
+          // image width and height in the canvas
+          const [iw, ih] = canvasCS.to([tile.width, tile.height, 0], lookPoint, fov);
+          ctx.drawImage(tile.image, 0, 0, tile.image.width, tile.image.height, ix | 0, iy | 0, iw | 0, ih | 0);
+        }
+      });
+      fovModel.subject.next(1); // limitation of Observable, need to initialize all.
+    }
+    window.onload = main;
+  </script>
+  <style>
+    #input-container, #map-container {
+      margin: 10px;
+    }
+    canvas {
+      box-shadow: 0 2px 2px 0 rgb(60,64,67,0.3),0 2px 6px -6px rgb(60,64,67,0.15);
+    }
+  </style>
+</head>
+<body>
+  <div id="input-container">
+    <input id="address" type="text" size=80>
+    <button id="go-btn">Go</button>
+  </div>
+  <div id="map-container">
+    <canvas id="map" width=1024 height=900>
+  </div>
+</body>
+</html>
